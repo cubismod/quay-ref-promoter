@@ -8,6 +8,16 @@ An interactive bash script to assist with promoting git refs to production names
 
 This tool simplifies the process of updating git references (branches, tags, commits) across multiple deployments in app-interface SAAS files. It provides an interactive terminal UI to select repositories, view active deployments, and update refs across one or many namespaces simultaneously.
 
+## Installation
+1. Clone this repo.
+1. Install [gum](https://github.com/charmbracelet/gum?tab=readme-ov-file#installation)
+1. Install [yq](https://github.com/mikefarah/yq#install)
+1. Run `make install` to install into `$HOME/.local/bin` (customizable with `$INSTALL_DIR` in Makefile)
+1. `export APP_INTERFACE_PATH=/path/to/app-interface` in your bash/zsh/other shell's config file
+
+- Then, you can run `promote-quay-refs.sh` in your shell to execute the script.
+- Run `make uninstall` to remove the script.
+
 ## Features
 
 - Interactive TUI powered by [gum](https://github.com/charmbracelet/gum)
