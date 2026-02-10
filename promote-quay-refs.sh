@@ -42,6 +42,21 @@ if ! command -v yq &> /dev/null; then
     exit 1
 fi
 
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed. Please install it to parse JSON responses."
+    exit 1
+fi
+
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is not installed. Please install it to check for migrations."
+    exit 1
+fi
+
+if ! command -v git &> /dev/null; then
+    echo "Error: git is not installed. Please install it to commit changes."
+    exit 1
+fi
+
 gum style \
     --foreground 212 --border-foreground 212 --border double \
     --align center --width 50 --margin "1 2" --padding "2 4" \
@@ -217,6 +232,83 @@ if [ -z "$NEW_REF" ]; then
     exit 0
 fi
 
+check_migrations() {
+    local old_ref="$1"
+    local new_ref="$2"
+    local repo_owner="quay"
+    local repo_name="quay"
+
+    local compare_result
+    compare_result=$(curl -s "https://api.github.com/repos/${repo_owner}/${repo_name}/compare/${old_ref}...${new_ref}" 2>/dev/null)
+
+    if [ -z "$compare_result" ]; then
+        return 0
+    fi
+
+    local migration_files
+    migration_files=$(echo "$compare_result" | jq -r '.files[]?.filename // empty' 2>/dev/null | grep "^data/migrations/" || true)
+
+    if [ -n "$migration_files" ]; then
+        echo "$migration_files"
+    fi
+
+    return 0
+}
+
+HAS_MIGRATIONS=false
+MIGRATION_FILES_LIST=""
+
+if [[ "$SELECTED_REPO" == *"github.com/quay/quay"* ]]; then
+    echo ""
+    gum style --foreground 226 "Checking for database migrations..."
+
+    declare -a OLD_REFS=()
+    while IFS= read -r SELECTED_DISPLAY; do
+        for KEY in "${!TARGET_DISPLAY[@]}"; do
+            if [ "${TARGET_DISPLAY[$KEY]}" = "$SELECTED_DISPLAY" ]; then
+                OLD_REF="${DEPLOYMENT_MAP[$KEY]}"
+                if [[ ! " ${OLD_REFS[@]} " =~ " ${OLD_REF} " ]]; then
+                    OLD_REFS+=("$OLD_REF")
+                fi
+            fi
+        done
+    done <<< "$SELECTED_TARGETS"
+
+    MIGRATIONS_FOUND=""
+    for OLD_REF in "${OLD_REFS[@]}"; do
+        MIGRATION_FILES=$(check_migrations "$OLD_REF" "$NEW_REF")
+        if [ -n "$MIGRATION_FILES" ]; then
+            if [ -z "$MIGRATIONS_FOUND" ]; then
+                MIGRATIONS_FOUND="$MIGRATION_FILES"
+            else
+                MIGRATIONS_FOUND="$MIGRATIONS_FOUND"$'\n'"$MIGRATION_FILES"
+            fi
+        fi
+    done
+
+    MIGRATIONS_FOUND=$(echo "$MIGRATIONS_FOUND" | sort -u | grep -v '^$' || true)
+
+    if [ -n "$MIGRATIONS_FOUND" ]; then
+        HAS_MIGRATIONS=true
+        MIGRATION_FILES_LIST="$MIGRATIONS_FOUND"
+        echo ""
+        gum style --foreground 196 --bold "⚠️  DATABASE MIGRATIONS DETECTED ⚠️"
+        echo ""
+        gum style --foreground 226 "The following migration files were found between the old and new refs:"
+        echo ""
+        echo "$MIGRATIONS_FOUND" | while read -r file; do
+            gum style --foreground 214 "  • $file"
+        done
+        echo ""
+        gum style --foreground 226 "Please ensure database migrations are applied before deploying!"
+        gum style --foreground 240 "See: https://github.com/quay/quay/tree/master/data/migrations"
+        echo ""
+        gum confirm "Continue with promotion despite migrations?" || exit 0
+    else
+        gum style --foreground 82 "✓ No new database migrations detected."
+    fi
+fi
+
 echo ""
 gum confirm "Update selected deployments to ref: $NEW_REF?" || exit 0
 
@@ -277,4 +369,69 @@ gum style --foreground 82 --bold "Updated ${#UPDATED_FILES[@]} file(s):"
 printf '%s\n' "${UPDATED_FILES[@]}" | sed 's/^/  - /'
 
 echo ""
-gum style --foreground 82 --bold "Done! You can now review and commit the changes."
+if gum confirm "Would you like to commit these changes?"; then
+    REPO_SHORT=$(echo "$SELECTED_REPO" | sed 's|.*github.com/||' | sed 's|\.git$||')
+    REF_SHORT="${NEW_REF:0:12}"
+
+    if [ "$HAS_MIGRATIONS" = true ]; then
+        COMMIT_TYPE="chore(deploy)!:"
+        COMMIT_SUBJECT="promote ${REPO_SHORT} to ${REF_SHORT}"
+
+        MIGRATION_COUNT=$(echo "$MIGRATION_FILES_LIST" | wc -l | tr -d ' ')
+        BREAKING_FOOTER="BREAKING CHANGE: This promotion includes ${MIGRATION_COUNT} database migration(s).
+Ensure migrations are applied before deployment.
+
+Migration files:
+$(echo "$MIGRATION_FILES_LIST" | sed 's/^/- /')"
+
+        COMMIT_MSG="${COMMIT_TYPE} ${COMMIT_SUBJECT}
+
+${BREAKING_FOOTER}"
+    else
+        COMMIT_TYPE="chore(deploy):"
+        COMMIT_SUBJECT="promote ${REPO_SHORT} to ${REF_SHORT}"
+        COMMIT_MSG="${COMMIT_TYPE} ${COMMIT_SUBJECT}"
+    fi
+
+    echo ""
+    gum style --foreground 105 "Proposed commit message:"
+    echo ""
+    gum style --foreground 240 "$COMMIT_MSG"
+    echo ""
+
+    EDIT_CHOICE=$(gum choose \
+        --header "How would you like to proceed?" \
+        "Use this message" \
+        "Edit message" \
+        "Cancel commit")
+
+    case "$EDIT_CHOICE" in
+        "Use this message")
+            ;;
+        "Edit message")
+            COMMIT_MSG=$(gum write --placeholder "Edit commit message..." --value "$COMMIT_MSG" --width 80 --height 15)
+            if [ -z "$COMMIT_MSG" ]; then
+                gum style --foreground 196 "Empty commit message. Commit cancelled."
+                exit 0
+            fi
+            ;;
+        "Cancel commit")
+            gum style --foreground 226 "Commit cancelled. Files have been updated but not committed."
+            exit 0
+            ;;
+    esac
+
+    git -C "$APP_INTERFACE_DIR" add "${UPDATED_FILES[@]}"
+    git -C "$APP_INTERFACE_DIR" commit -m "$COMMIT_MSG"
+
+    echo ""
+    gum style --foreground 82 --bold "Changes committed successfully!"
+
+    if [ "$HAS_MIGRATIONS" = true ]; then
+        echo ""
+        gum style --foreground 226 "Remember: Database migrations must be applied before deployment!"
+    fi
+else
+    echo ""
+    gum style --foreground 82 --bold "Done! You can review and commit the changes manually."
+fi
